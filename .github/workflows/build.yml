@@ -1,4 +1,4 @@
-name: Build TurkiccAC (Maven)
+name: Build TurkiccAC
 
 on:
   push:
@@ -16,13 +16,20 @@ jobs:
       with:
         java-version: '21'
         distribution: 'temurin'
-        cache: 'maven'
 
+    # This builds the project even if your pom.xml is hidden inside a subfolder
     - name: Build with Maven
-      run: mvn clean package
+      run: |
+        POM_PATH=$(find . -name "pom.xml" | head -n 1)
+        if [ -z "$POM_PATH" ]; then
+          echo "ERROR: Could not find pom.xml anywhere in this repository!"
+          exit 1
+        fi
+        echo "Found pom.xml at: $POM_PATH"
+        mvn -f "$POM_PATH" clean package
 
     - name: Upload Build Artifact
       uses: actions/upload-artifact@v4
       with:
         name: TurkiccAC-Jar
-        path: target/*.jar
+        path: "**/target/*.jar"
