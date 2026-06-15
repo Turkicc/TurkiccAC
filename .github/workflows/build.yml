@@ -22,14 +22,31 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          ls -la
           ZIP="$(find . -maxdepth 1 -type f -name '*.zip' -print -quit)"
           test -n "$ZIP"
           echo "Using zip: $ZIP"
-          mkdir -p _src
-          cd _src
-          jar xf "../${ZIP#./}"
-          cd ..
+
+          python3 - <<'PY'
+          import zipfile, pathlib
+
+          zip_path = next(pathlib.Path(".").glob("*.zip"))
+          out = pathlib.Path("_src")
+          out.mkdir(exist_ok=True)
+
+          with zipfile.ZipFile(zip_path) as z:
+              for info in z.infolist():
+                  name = info.filename.replace("\\", "/")
+                  if not name or name.endswith("/"):
+                      continue
+                  target = out / name
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(z.read(info))
+
+          print("Extracted files:")
+          for p in out.rglob("*"):
+              print(p)
+          PY
+
           POM="$(find _src -name pom.xml -print -quit)"
           test -n "$POM"
           echo "Using pom: $POM"
