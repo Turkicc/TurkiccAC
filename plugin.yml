@@ -1,0 +1,122 @@
+package com.example.ac.config;
+
+import com.example.ac.violation.PunishmentTier;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.plugin.java.JavaPlugin;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.logging.Level;
+
+/**
+ * Loads config.yml into typed fields once at startup / reload. Per-check
+ * settings stay as {@link ConfigurationSection}s that each check reads itself,
+ * which keeps adding a new check a one-file change.
+ */
+public final class ACConfig {
+
+    private final JavaPlugin plugin;
+
+    // global
+    public int violationTickInterval;
+    public String alertFormat;
+    public long alertCooldownMs;
+    public boolean fileLogging;
+
+    // lag comp
+    public int historyTicks;
+    public int rewindToleranceTicks;
+
+    // exemptions
+    public int afterTeleportTicks;
+    public int afterJoinTicks;
+    public int afterRespawnTicks;
+    public int afterPacketGapTicks;
+    public long maxPacketGapMs;
+    public double minTps;
+    public int maxPing;
+    public boolean skipVehicles;
+    public boolean skipElytra;
+
+    private final Map<String, List<PunishmentTier>> tiers = new HashMap<>();
+
+    public ACConfig(JavaPlugin plugin) {
+        this.plugin = plugin;
+        reload();
+    }
+
+    public void reload() {
+        plugin.reloadConfig();
+        var c = plugin.getConfig();
+
+        violationTickInterval = c.getInt("violation-tick-interval", 20);
+        alertFormat = color(c.getString("alert-format",
+                "&8[&cSentinel&8] &f{player} &7failed &e{check}"));
+        alertCooldownMs = c.getLong("alert-cooldown-ms", 1500);
+        fileLogging = c.getBoolean("file-logging", true);
+
+        historyTicks = c.getInt("lag-comp.history-ticks", 20);
+        rewindToleranceTicks = c.getInt("lag-comp.rewind-tolerance-ticks", 2);
+
+        afterTeleportTicks = c.getInt("exempt.after-teleport-ticks", 20);
+        afterJoinTicks = c.getInt("exempt.after-join-ticks", 60);
+        afterRespawnTicks = c.getInt("exempt.after-respawn-ticks", 40);
+        afterPacketGapTicks = c.getInt("exempt.after-packet-gap-ticks", 20);
+        maxPacketGapMs = c.getLong("exempt.max-packet-gap-ms", 250L);
+        minTps = c.getDouble("exempt.min-tps", 17.0);
+        maxPing = c.getInt("exempt.max-ping", 0);
+        skipVehicles = c.getBoolean("exempt.skip-vehicles", false);
+        skipElytra = c.getBoolean("exempt.skip-elytra", false);
+
+        loadTiers(c.getConfigurationSection("punishment-tiers"));
+    }
+
+    private void loadTiers(ConfigurationSection section) {
+        tiers.clear();
+        if (section == null) return;
+        for (String tierName : section.getKeys(false)) {
+            List<Map<?, ?>> raw = section.getMapList(tierName);
+            List<PunishmentTier> list = new ArrayList<>();
+            for (Map<?, ?> entry : raw) {
+                try {
+                    double vl = ((Number) entry.get("vl")).doubleValue();
+                    List<PunishmentTier.Action> actions = new ArrayList<>();
+                    Object actObj = entry.get("actions");
+                    if (actObj instanceof List<?> al) {
+                        for (Object a : al) {
+                            actions.add(PunishmentTier.Action.valueOf(
+                                    String.valueOf(a).toUpperCase(Locale.ROOT)));
+                        }
+                    }
+                    String kick = entry.get("kick-message") == null ? null
+                            : color(String.valueOf(entry.get("kick-message")));
+                    String ban = entry.get("ban-command") == null ? null
+                            : String.valueOf(entry.get("ban-command"));
+                    list.add(new PunishmentTier(vl, actions, kick, ban));
+                } catch (Exception ex) {
+                    plugin.getLogger().log(Level.WARNING,
+                            "Bad punishment tier in '" + tierName + "': " + entry, ex);
+                }
+            }
+            // sort ascending by vl so we can find the highest crossed tier
+            list.sort((a, b) -> Double.compare(a.vl, b.vl));
+            tiers.put(tierName, list);
+        }
+    }
+
+    public List<PunishmentTier> getTiers(String name) {
+        return tiers.getOrDefault(name, List.of());
+    }
+
+    /** The {@code checks.<name>} section, or null if absent. */
+    public ConfigurationSection checkSection(String checkName) {
+        return plugin.getConfig().getConfigurationSection("checks." + checkName);
+    }
+
+    public static String color(String s) {
+        return s == null ? "" : s.replace('&', '\u00A7');
+    }
+}
