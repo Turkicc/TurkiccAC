@@ -1,24 +1,50 @@
 name: Build plugin jar
+
 on:
   push:
   workflow_dispatch:
+
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
-      - name: Unzip and build
+
+      - name: Extract source zip
+        shell: bash
         run: |
-          ZIP=$(ls *.zip | head -1)
-          unzip -o "$ZIP" -d _src
-          POMDIR=$(dirname "$(find _src -name pom.xml | head -1)")
+          set -euxo pipefail
+          ls -la
+          ZIP="$(find . -maxdepth 1 -type f -name '*.zip' -print -quit)"
+          test -n "$ZIP"
+          echo "Using zip: $ZIP"
+          mkdir -p _src
+          cd _src
+          jar xf "../${ZIP#./}"
+          cd ..
+          POM="$(find _src -name pom.xml -print -quit)"
+          test -n "$POM"
+          echo "Using pom: $POM"
+
+      - name: Build with Maven
+        shell: bash
+        run: |
+          set -euxo pipefail
+          POM="$(find _src -name pom.xml -print -quit)"
+          POMDIR="$(dirname "$POM")"
           cd "$POMDIR"
           mvn -B -U clean package
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
         with:
           name: SentinelAC-jar
           path: _src/**/target/*.jar
