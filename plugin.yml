@@ -1,122 +1,257 @@
-package com.example.ac.config;
+package com.example.ac.violation;
 
-import com.example.ac.violation.PunishmentTier;
+import com.example.ac.check.Check;
+import com.example.ac.config.ACConfig;
+import com.example.ac.data.PlayerData;
+import com.example.ac.util.SchedulerUtil;
+import org.bukkit.Bukkit;
 import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 
-import java.util.ArrayList;
+import java.io.File;
+import java.io.IOException;
+import java.io.Writer;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 
 /**
- * Loads config.yml into typed fields once at startup / reload. Per-check
- * settings stay as {@link ConfigurationSection}s that each check reads itself,
- * which keeps adding a new check a one-file change.
+ * Central accounting for violations:
+ *   - {@link #flag} adds weighted VL (capped at the check's max), writes a log
+ *     line, sends throttled staff alerts, and runs the matching punishment tier.
+ *   - {@link #decayTick} is called on a fixed schedule to bleed VL down so a
+ *     clean player eventually returns to zero.
+ *
+ * A single anomalous tick can never ban: punishments are gated behind VL
+ * thresholds, and KICK/BAN are guarded so they don't re-fire in a burst.
  */
-public final class ACConfig {
+public final class ViolationManager {
 
     private final JavaPlugin plugin;
+    private final ACConfig config;
 
-    // global
-    public int violationTickInterval;
-    public String alertFormat;
-    public long alertCooldownMs;
-    public boolean fileLogging;
+    /** Throttle: "uuid:check" -> last alert time (ms). */
+    private final ConcurrentHashMap<String, Long> alertGuard = new ConcurrentHashMap<>();
+    /** Guard so KICK/BAN don't spam: "uuid:check:action" -> last fire time (ms). */
+    private final ConcurrentHashMap<String, Long> punishGuard = new ConcurrentHashMap<>();
+    /** Staff who have toggled their own alerts off via /sentinel alerts. */
+    private final java.util.Set<java.util.UUID> mutedAlerts =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
 
-    // lag comp
-    public int historyTicks;
-    public int rewindToleranceTicks;
+    private final DateTimeFormatter ts = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private Path logFile;
 
-    // exemptions
-    public int afterTeleportTicks;
-    public int afterJoinTicks;
-    public int afterRespawnTicks;
-    public int afterPacketGapTicks;
-    public long maxPacketGapMs;
-    public double minTps;
-    public int maxPing;
-    public boolean skipVehicles;
-    public boolean skipElytra;
+    /** violations.yml file (null if persistence is off). */
+    private File violationsFile;
+    /** uuid -> (check -> vl) loaded from disk, applied when a player joins. */
+    private final Map<UUID, Map<String, Double>> savedVls = new ConcurrentHashMap<>();
 
-    private final Map<String, List<PunishmentTier>> tiers = new HashMap<>();
-
-    public ACConfig(JavaPlugin plugin) {
+    public ViolationManager(JavaPlugin plugin, ACConfig config) {
         this.plugin = plugin;
-        reload();
-    }
-
-    public void reload() {
-        plugin.reloadConfig();
-        var c = plugin.getConfig();
-
-        violationTickInterval = c.getInt("violation-tick-interval", 20);
-        alertFormat = color(c.getString("alert-format",
-                "&8[&cSentinel&8] &f{player} &7failed &e{check}"));
-        alertCooldownMs = c.getLong("alert-cooldown-ms", 1500);
-        fileLogging = c.getBoolean("file-logging", true);
-
-        historyTicks = c.getInt("lag-comp.history-ticks", 20);
-        rewindToleranceTicks = c.getInt("lag-comp.rewind-tolerance-ticks", 2);
-
-        afterTeleportTicks = c.getInt("exempt.after-teleport-ticks", 20);
-        afterJoinTicks = c.getInt("exempt.after-join-ticks", 60);
-        afterRespawnTicks = c.getInt("exempt.after-respawn-ticks", 40);
-        afterPacketGapTicks = c.getInt("exempt.after-packet-gap-ticks", 20);
-        maxPacketGapMs = c.getLong("exempt.max-packet-gap-ms", 250L);
-        minTps = c.getDouble("exempt.min-tps", 17.0);
-        maxPing = c.getInt("exempt.max-ping", 0);
-        skipVehicles = c.getBoolean("exempt.skip-vehicles", false);
-        skipElytra = c.getBoolean("exempt.skip-elytra", false);
-
-        loadTiers(c.getConfigurationSection("punishment-tiers"));
-    }
-
-    private void loadTiers(ConfigurationSection section) {
-        tiers.clear();
-        if (section == null) return;
-        for (String tierName : section.getKeys(false)) {
-            List<Map<?, ?>> raw = section.getMapList(tierName);
-            List<PunishmentTier> list = new ArrayList<>();
-            for (Map<?, ?> entry : raw) {
-                try {
-                    double vl = ((Number) entry.get("vl")).doubleValue();
-                    List<PunishmentTier.Action> actions = new ArrayList<>();
-                    Object actObj = entry.get("actions");
-                    if (actObj instanceof List<?> al) {
-                        for (Object a : al) {
-                            actions.add(PunishmentTier.Action.valueOf(
-                                    String.valueOf(a).toUpperCase(Locale.ROOT)));
-                        }
-                    }
-                    String kick = entry.get("kick-message") == null ? null
-                            : color(String.valueOf(entry.get("kick-message")));
-                    String ban = entry.get("ban-command") == null ? null
-                            : String.valueOf(entry.get("ban-command"));
-                    list.add(new PunishmentTier(vl, actions, kick, ban));
-                } catch (Exception ex) {
-                    plugin.getLogger().log(Level.WARNING,
-                            "Bad punishment tier in '" + tierName + "': " + entry, ex);
-                }
+        this.config = config;
+        try {
+            Path dir = plugin.getDataFolder().toPath();
+            Files.createDirectories(dir);
+            if (config.fileLogging) logFile = dir.resolve("sentinel.log");
+            if (config.saveViolations) {
+                violationsFile = dir.resolve("violations.yml").toFile();
+                loadSaved();
             }
-            // sort ascending by vl so we can find the highest crossed tier
-            list.sort((a, b) -> Double.compare(a.vl, b.vl));
-            tiers.put(tierName, list);
+        } catch (IOException e) {
+            plugin.getLogger().log(Level.WARNING, "Could not prepare SentinelAC data folder", e);
         }
     }
 
-    public List<PunishmentTier> getTiers(String name) {
-        return tiers.getOrDefault(name, List.of());
+    /**
+     * Record a violation. Thread-safe; usually called from a Netty packet
+     * thread. Bukkit-touching actions (kick/ban/alert dispatch) are scheduled
+     * onto the correct thread internally.
+     */
+    public FlagResult flag(Check check, PlayerData data, String reason, double weight) {
+        double newVl = data.addViolation(check.name(), weight, check.maxVl());
+
+        // File log every flag.
+        log(data, check.name(), reason, newVl);
+
+        // Find the highest tier whose threshold we've crossed.
+        PunishmentTier crossed = null;
+        for (PunishmentTier tier : config.getTiers(check.punishmentTier())) {
+            if (newVl >= tier.vl) crossed = tier; // list is ascending
+        }
+
+        boolean cancel = false;
+        if (crossed != null) {
+            if (crossed.has(PunishmentTier.Action.ALERT)) {
+                sendAlert(data, check.name(), reason, newVl);
+            }
+            cancel = crossed.has(PunishmentTier.Action.CANCEL);
+            if (crossed.has(PunishmentTier.Action.KICK)) {
+                tryKick(data, check.name(), crossed);
+            }
+            if (crossed.has(PunishmentTier.Action.BAN)) {
+                tryBan(data, check.name(), reason, newVl, crossed);
+            }
+        }
+        return new FlagResult(newVl, cancel);
     }
 
-    /** The {@code checks.<name>} section, or null if absent. */
-    public ConfigurationSection checkSection(String checkName) {
-        return plugin.getConfig().getConfigurationSection("checks." + checkName);
+    private void sendAlert(PlayerData data, String check, String reason, double vl) {
+        long now = System.currentTimeMillis();
+        String key = data.uuid + ":" + check;
+        Long last = alertGuard.get(key);
+        if (last != null && now - last < config.alertCooldownMs) return;
+        alertGuard.put(key, now);
+
+        String msg = config.alertFormat
+                .replace("{player}", data.name)
+                .replace("{check}", check)
+                .replace("{reason}", reason)
+                .replace("{vl}", String.format("%.1f", vl))
+                .replace("{ping}", String.valueOf(data.pingMs));
+
+        // Component/legacy message sends are safe from any thread on Paper.
+        Bukkit.getConsoleSender().sendMessage(msg);
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            if (p.hasPermission("anticheat.alerts") && !mutedAlerts.contains(p.getUniqueId())) {
+                p.sendMessage(msg);
+            }
+        }
     }
 
-    public static String color(String s) {
-        return s == null ? "" : s.replace('&', '\u00A7');
+    /** Toggle a staff member's alert visibility. @return true if now receiving. */
+    public boolean toggleAlerts(java.util.UUID uuid) {
+        if (mutedAlerts.remove(uuid)) return true;
+        mutedAlerts.add(uuid);
+        return false;
+    }
+
+    private void tryKick(PlayerData data, String check, PunishmentTier tier) {
+        if (guarded(data, check, "KICK")) return;
+        Player p = Bukkit.getPlayer(data.uuid);
+        if (p == null) return;
+        String reason = tier.kickMessage != null ? tier.kickMessage : "\u00A7cKicked by anti-cheat.";
+        SchedulerUtil.runForEntity(plugin, p, () -> {
+            if (p.isOnline()) p.kick(net.kyori.adventure.text.Component.text(reason));
+        });
+    }
+
+    private void tryBan(PlayerData data, String check, String reason, double vl, PunishmentTier tier) {
+        if (guarded(data, check, "BAN")) return;
+        if (tier.banCommand == null) return;
+        String cmd = tier.banCommand
+                .replace("{player}", data.name)
+                .replace("{check}", check)
+                .replace("{reason}", reason)
+                .replace("{vl}", String.format("%.1f", vl));
+        // Commands must run on the main/global thread.
+        SchedulerUtil.runGlobalOnce(plugin,
+                () -> Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd));
+    }
+
+    /** True if this action fired for this player+check within the last 5s. */
+    private boolean guarded(PlayerData data, String check, String action) {
+        long now = System.currentTimeMillis();
+        String key = data.uuid + ":" + check + ":" + action;
+        Long last = punishGuard.get(key);
+        if (last != null && now - last < 5000) return true;
+        punishGuard.put(key, now);
+        return false;
+    }
+
+    private void log(PlayerData data, String check, String reason, double vl) {
+        if (logFile == null) return;
+        String line = "[" + LocalDateTime.now().format(ts) + "] "
+                + data.name + " (" + data.uuid + ") " + check
+                + " | " + reason + " | vl=" + String.format("%.1f", vl)
+                + " | ping=" + data.pingMs + "ms\n";
+        try (Writer w = Files.newBufferedWriter(logFile, StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
+            w.write(line);
+        } catch (IOException ignored) {
+            // never let logging failure affect gameplay
+        }
+    }
+
+    /** Called every {@code violation-tick-interval} ticks to decay all VL. */
+    public void decayTick(Iterable<PlayerData> players, ViolationDecayLookup lookup) {
+        for (PlayerData data : players) {
+            for (String checkName : data.getViolations().keySet()) {
+                double decay = lookup.decayFor(checkName);
+                if (decay > 0) data.decayViolation(checkName, decay);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    //  Persistence (violations.yml)
+    // -----------------------------------------------------------------------
+
+    /** Load saved VL from disk into memory (applied per-player on join). */
+    private void loadSaved() {
+        savedVls.clear();
+        if (violationsFile == null || !violationsFile.exists()) return;
+        try {
+            YamlConfiguration yml = YamlConfiguration.loadConfiguration(violationsFile);
+            for (String uuidKey : yml.getKeys(false)) {
+                ConfigurationSection sec = yml.getConfigurationSection(uuidKey);
+                if (sec == null) continue;
+                Map<String, Double> m = new HashMap<>();
+                for (String check : sec.getKeys(false)) {
+                    double vl = sec.getDouble(check, 0.0);
+                    if (vl > 0.0) m.put(check, vl);
+                }
+                if (!m.isEmpty()) savedVls.put(UUID.fromString(uuidKey), m);
+            }
+        } catch (Throwable t) {
+            plugin.getLogger().log(Level.WARNING, "Could not read violations.yml", t);
+        }
+    }
+
+    /** Restore a (re)joining player's saved VL into their live data. */
+    public void restore(PlayerData data) {
+        Map<String, Double> m = savedVls.get(data.uuid);
+        if (m == null) return;
+        for (Map.Entry<String, Double> e : m.entrySet()) {
+            data.restoreViolation(e.getKey(), e.getValue());
+        }
+    }
+
+    /** Persist every tracked player's current VL to violations.yml. */
+    public void saveAll(Collection<PlayerData> players) {
+        if (violationsFile == null) return;
+        try {
+            YamlConfiguration yml = new YamlConfiguration();
+            for (PlayerData data : players) {
+                Map<String, Double> v = data.getViolations();
+                for (Map.Entry<String, Double> e : v.entrySet()) {
+                    if (e.getValue() != null && e.getValue() > 0.0) {
+                        yml.set(data.uuid + "." + e.getKey(), Math.round(e.getValue() * 10.0) / 10.0);
+                        // keep the in-memory snapshot current for next restore
+                        savedVls.computeIfAbsent(data.uuid, k -> new HashMap<>())
+                                .put(e.getKey(), e.getValue());
+                    }
+                }
+            }
+            yml.save(violationsFile);
+        } catch (Throwable t) {
+            plugin.getLogger().log(Level.WARNING, "Could not write violations.yml", t);
+        }
+    }
+
+    /** Supplies the per-check decay rate to {@link #decayTick}. */
+    public interface ViolationDecayLookup {
+        double decayFor(String checkName);
     }
 }

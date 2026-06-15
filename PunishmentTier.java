@@ -1,66 +1,126 @@
-package com.example.ac.check.movement;
+package com.example.ac.config;
 
-import com.example.ac.data.PlayerData;
+import com.example.ac.violation.PunishmentTier;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.plugin.java.JavaPlugin;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.logging.Level;
 
 /**
- * Hook for the "gold standard" movement check described in the build spec: a
- * 1:1 replication of the player's physically-possible movement each tick.
- * Instead of a threshold, you simulate every legal outcome given the player's
- * inputs, knockback, collisions, fluids, vehicles and block effects, then check
- * whether the player's ACTUAL displacement falls inside that legal set. A
- * correct simulation is effectively unbypassable because it encodes all legal
- * moves; the threshold model in {@link SpeedCheck} is only the fallback.
- *
- * <p><b>This is deliberately a stub.</b> A faithful engine is thousands of lines
- * and needs the per-player world replica (block states queried off-thread) plus
- * full reimplementation of vanilla {@code LivingEntity}/{@code Player} movement
- * physics for the exact MC version. Building that is a project in itself and is
- * out of scope for this deliverable, so {@link #verify} returns
- * {@link Result#UNAVAILABLE} until you implement it. {@code SpeedCheck} treats
- * UNAVAILABLE as "fall back to thresholds", so the plugin works today and you
- * can grow into the engine later by:
- *   1. building {@code WorldReplica} from chunk/block-change packets,
- *   2. porting per-tick physics (input -> friction -> gravity -> collide),
- *   3. returning a tight legal displacement bound here.
+ * Loads config.yml into typed fields once at startup / reload. Per-check
+ * settings stay as {@link ConfigurationSection}s that each check reads itself,
+ * which keeps adding a new check a one-file change.
  */
-public interface SimulationEngine {
+public final class ACConfig {
 
-    enum Verdict { LEGAL, ILLEGAL, UNAVAILABLE }
+    private final JavaPlugin plugin;
 
-    final class Result {
-        public final Verdict verdict;
-        /** How far past the legal envelope (blocks), when ILLEGAL; else 0. */
-        public final double overage;
-        public final String detail;
+    // global
+    public int violationTickInterval;
+    public String alertFormat;
+    public long alertCooldownMs;
+    public boolean fileLogging;
 
-        public Result(Verdict verdict, double overage, String detail) {
-            this.verdict = verdict;
-            this.overage = overage;
-            this.detail = detail;
-        }
+    // lag comp
+    public int historyTicks;
+    public int rewindToleranceTicks;
 
-        public static final Result UNAVAILABLE =
-                new Result(Verdict.UNAVAILABLE, 0, "simulation engine not implemented");
-        public static Result legal() { return new Result(Verdict.LEGAL, 0, "ok"); }
-        public static Result illegal(double overage, String detail) {
-            return new Result(Verdict.ILLEGAL, overage, detail);
+    // exemptions
+    public int afterTeleportTicks;
+    public int afterJoinTicks;
+    public int afterRespawnTicks;
+    public double minTps;
+    public int maxPing;
+    public boolean skipVehicles;
+    public boolean skipElytra;
+    public long packetGapMs;
+    public int packetGapGraceTicks;
+
+    // persistence
+    public boolean saveViolations;
+
+    private final Map<String, List<PunishmentTier>> tiers = new HashMap<>();
+
+    public ACConfig(JavaPlugin plugin) {
+        this.plugin = plugin;
+        reload();
+    }
+
+    public void reload() {
+        plugin.reloadConfig();
+        var c = plugin.getConfig();
+
+        violationTickInterval = c.getInt("violation-tick-interval", 20);
+        alertFormat = color(c.getString("alert-format",
+                "&8[&cSentinel&8] &f{player} &7failed &e{check}"));
+        alertCooldownMs = c.getLong("alert-cooldown-ms", 1500);
+        fileLogging = c.getBoolean("file-logging", true);
+        saveViolations = c.getBoolean("save-violations", true);
+
+        historyTicks = c.getInt("lag-comp.history-ticks", 20);
+        rewindToleranceTicks = c.getInt("lag-comp.rewind-tolerance-ticks", 2);
+
+        afterTeleportTicks = c.getInt("exempt.after-teleport-ticks", 20);
+        afterJoinTicks = c.getInt("exempt.after-join-ticks", 60);
+        afterRespawnTicks = c.getInt("exempt.after-respawn-ticks", 40);
+        minTps = c.getDouble("exempt.min-tps", 17.0);
+        maxPing = c.getInt("exempt.max-ping", 0);
+        skipVehicles = c.getBoolean("exempt.skip-vehicles", false);
+        skipElytra = c.getBoolean("exempt.skip-elytra", false);
+        packetGapMs = c.getLong("exempt.packet-gap-ms", 250);
+        packetGapGraceTicks = c.getInt("exempt.packet-gap-grace-ticks", 20);
+
+        loadTiers(c.getConfigurationSection("punishment-tiers"));
+    }
+
+    private void loadTiers(ConfigurationSection section) {
+        tiers.clear();
+        if (section == null) return;
+        for (String tierName : section.getKeys(false)) {
+            List<Map<?, ?>> raw = section.getMapList(tierName);
+            List<PunishmentTier> list = new ArrayList<>();
+            for (Map<?, ?> entry : raw) {
+                try {
+                    double vl = ((Number) entry.get("vl")).doubleValue();
+                    List<PunishmentTier.Action> actions = new ArrayList<>();
+                    Object actObj = entry.get("actions");
+                    if (actObj instanceof List<?> al) {
+                        for (Object a : al) {
+                            actions.add(PunishmentTier.Action.valueOf(
+                                    String.valueOf(a).toUpperCase(Locale.ROOT)));
+                        }
+                    }
+                    String kick = entry.get("kick-message") == null ? null
+                            : color(String.valueOf(entry.get("kick-message")));
+                    String ban = entry.get("ban-command") == null ? null
+                            : String.valueOf(entry.get("ban-command"));
+                    list.add(new PunishmentTier(vl, actions, kick, ban));
+                } catch (Exception ex) {
+                    plugin.getLogger().log(Level.WARNING,
+                            "Bad punishment tier in '" + tierName + "': " + entry, ex);
+                }
+            }
+            // sort ascending by vl so we can find the highest crossed tier
+            list.sort((a, b) -> Double.compare(a.vl, b.vl));
+            tiers.put(tierName, list);
         }
     }
 
-    /**
-     * Verify a player's movement for the just-completed tick.
-     *
-     * @param data        the player
-     * @param dx,dy,dz    actual displacement this tick (blocks)
-     * @param tick        the tick being evaluated
-     */
-    Result verify(PlayerData data, double dx, double dy, double dz, long tick);
+    public List<PunishmentTier> getTiers(String name) {
+        return tiers.getOrDefault(name, List.of());
+    }
 
-    /** The always-available no-op used until a real engine is dropped in. */
-    final class Unimplemented implements SimulationEngine {
-        @Override
-        public Result verify(PlayerData data, double dx, double dy, double dz, long tick) {
-            return Result.UNAVAILABLE;
-        }
+    /** The {@code checks.<name>} section, or null if absent. */
+    public ConfigurationSection checkSection(String checkName) {
+        return plugin.getConfig().getConfigurationSection("checks." + checkName);
+    }
+
+    public static String color(String s) {
+        return s == null ? "" : s.replace('&', '\u00A7');
     }
 }

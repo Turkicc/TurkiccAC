@@ -1,8 +1,17 @@
-target/
-*.class
-.idea/
-*.iml
-.vscode/
-.settings/
-.classpath
-.project
+package com.example.ac.violation;
+
+/**
+ * Returned by {@link ViolationManager#flag}. The caller (a combat check or the
+ * movement check) decides how to apply {@link #cancel}: combat checks cancel
+ * the attack/interact packet so the hit never registers; the movement check
+ * triggers a position set-back.
+ */
+public final class FlagResult {
+    public final double vl;
+    public final boolean cancel;
+
+    public FlagResult(double vl, boolean cancel) {
+        this.vl = vl;
+        this.cancel = cancel;
+    }
+}
