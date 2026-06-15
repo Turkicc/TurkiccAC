@@ -1,27 +1,38 @@
-name: Build plugin jar
+name: Build TurkiccAC
+
 on:
   push:
-  workflow_dispatch:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-      - name: Unzip and build
-        run: |
-          ZIP=$(ls *.zip | head -1)
-          echo "Extracting $ZIP"
-          unzip -o "$ZIP" -d _src
-          POMDIR=$(dirname "$(find _src -name pom.xml | head -1)")
-          echo "Building in $POMDIR"
-          cd "$POMDIR"
-          mvn -B -U clean package
-      - uses: actions/upload-artifact@v4
-        with:
-          name: SentinelAC-jar
-          path: _src/**/target/*.jar
-          if-no-files-found: error
+    # Step 1: Check out the repository source code
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    # Step 2: Set up Java 21 (Required for Minecraft 1.21.x development)
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+
+    # Step 3: Grant execute permission to the Gradle wrapper
+    - name: Setup Gradle Permissions
+      run: chmod +x ./gradlew
+
+    # Step 4: Build the project using Gradle
+    - name: Build with Gradle
+      run: ./gradlew build
+
+    # Step 5: Upload the compiled .jar file as an artifact
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: TurkiccAC-Jar
+        path: build/libs/*.jar
