@@ -1,0 +1,27 @@
+package com.example.ac.violation;
+
+import java.util.List;
+
+/**
+ * A single escalation step: when a check's VL reaches {@link #vl}, run
+ * {@link #actions}. Loaded from the {@code punishment-tiers} section of
+ * config.yml.
+ */
+public final class PunishmentTier {
+
+    public enum Action { ALERT, CANCEL, KICK, BAN }
+
+    public final double vl;
+    public final List<Action> actions;
+    public final String kickMessage;   // nullable
+    public final String banCommand;    // nullable, {player}{check}{vl}{reason} expanded
+
+    public PunishmentTier(double vl, List<Action> actions, String kickMessage, String banCommand) {
+        this.vl = vl;
+        this.actions = actions;
+        this.kickMessage = kickMessage;
+        this.banCommand = banCommand;
+    }
+
+    public boolean has(Action a) { return actions.contains(a); }
+}
